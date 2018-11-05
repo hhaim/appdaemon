@@ -25,6 +25,11 @@ import pstats
 
 import appdaemon.utils as utils
 
+APP_PIN = 'app_pin' 
+
+def is_app_pin (dict):
+    return ( (APP_PIN in dict) and dict[APP_PIN] ) 
+
 
 class AppDaemon:
 
@@ -38,7 +43,6 @@ class AppDaemon:
         self.config = kwargs
         self.booted = datetime.datetime.now()
         self.config["ad_version"] = utils.__version__
-        self.q = Queue(maxsize=0)
         self.check_app_updates_profile = ""
 
         self.was_dst = False
@@ -247,13 +251,17 @@ class AppDaemon:
 
             self.log("DEBUG", "Creating worker threads ...")
 
+            self.thread_id = []
             # Create Worker Threads
             for i in range(self.threads):
                 t = threading.Thread(target=self.worker)
                 t.daemon = True
+                t.q = Queue(maxsize=0) 
+                t.id = i
                 t.setName("thread-{}".format(i+1))
                 with self.thread_info_lock:
                     self.thread_info["threads"][t.getName()] = {"callback": "idle", "time_called": 0, "thread": t}
+                    self.thread_id.append(t) # quick index to thread object 
                 t.start()
 
             if self.apps is True:
@@ -438,9 +446,7 @@ class AppDaemon:
         self.diag("INFO", "--------------------------------------------------")
 
     def dump_queue(self):
-        self.diag("INFO", "--------------------------------------------------")
-        self.diag("INFO", "Current Queue Size is {}".format(self.q.qsize()))
-        self.diag("INFO", "--------------------------------------------------")
+        pass
 
     @staticmethod
     def atoi(text):
@@ -479,12 +485,14 @@ class AppDaemon:
             self.diag("INFO", "--------------------------------------------------")
             for thread in sorted(self.thread_info["threads"], key=self.natural_keys):
                 ts = datetime.datetime.fromtimestamp(self.thread_info["threads"][thread]["time_called"])
+                t = self.thread_info["threads"][thread]["thread"]
                 self.diag("INFO",
-                         "{} - current callback: {} since {}, alive: {}".format(
+                         "{} - current callback: {} since {}, alive: {}, qz {} ".format(
                              thread,
                              self.thread_info["threads"][thread]["callback"],
                              ts,
-                             self.thread_info["threads"][thread]["thread"].is_alive()
+                             t.is_alive(),
+                             t.q.qsize()
                          ))
         self.diag("INFO", "--------------------------------------------------")
 
@@ -559,7 +567,22 @@ class AppDaemon:
                     unconstrained = False
 
         if unconstrained:
-            self.q.put_nowait(args)
+            object = self.objects[name]["object"]
+            q=None
+            if object.__app_pin:
+               q = self.get_tid_queue(object.__pin_thread)
+            else:
+               q = self.get_random_queue ()
+
+            q.put_nowait(args)
+
+
+    def get_tid_queue (self,tid):
+        return self.thread_id[tid].q
+
+    def get_random_queue (self):
+        rid = random.randrange(self.threads)
+        return self.thread_id[rid].q
 
     def update_thread_info(self, thread_id, callback, type = None):
         if self.log_thread_actions:
@@ -586,9 +609,12 @@ class AppDaemon:
 
     # noinspection PyBroadException
     def worker(self):
+
+        thread = threading.current_thread()
+        thread_id = thread.name
+
         while True:
-            thread_id = threading.current_thread().name
-            args = self.q.get()
+            args = thread.q.get()
             _type = args["type"]
             funcref = args["function"]
             _id = args["id"]
@@ -631,7 +657,7 @@ class AppDaemon:
             else:
                 self.log("WARNING", "Found stale callback for {} - discarding".format(name))
 
-            self.q.task_done()
+            thread.q.task_done()
 
     #
     # State
@@ -1472,12 +1498,8 @@ class AppDaemon:
                                           "Unexpected error refreshing {} state - retrying in 10 minutes".format(plugin))
 
                     # Check for thread starvation
-
-                    qsize = self.q.qsize()
-                    if qsize > 0 and qsize % 10 == 0:
-                        self.log("WARNING", "Queue size is {}, suspect thread starvation".format(self.q.qsize()))
-
-                        self.dump_threads()
+                    # TBD need to check all threads queue size 
+                    #self.dump_threads()
 
                     # Run utility for each plugin
 
@@ -1601,8 +1623,22 @@ class AppDaemon:
                     "id": uuid.uuid4()
                 }
 
-                init = self.objects[name]["object"].initialize
+                object = self.objects[name]["object"]
+                object.__app_pin = False
+                object.__pin_thread = 0
 
+                metad = object.__class__.__dict__
+                metad_p = object.__class__.__bases__[0].__dict__
+
+                # check to see if app_pin is in parent class, class or config
+                l = [metad,metad_p,app_args]
+                for o in l:
+                    if is_app_pin(o):
+                        object.__app_pin = True
+                        object.__pin_thread = random.randrange(self.threads)
+                        break;
+
+                init = object.initialize
                 # Call its initialize function
 
             try:
